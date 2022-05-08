@@ -109,7 +109,7 @@ func (bs *BigStats) reset() {
 // Call Reset when the cache is no longer needed. This reclaims the allocated
 // memory.
 type Cache struct {
-	buckets [bucketsCount]bucket
+	buckets [bucketsCount]bucket // 512个桶
 
 	bigStats BigStats
 }
@@ -120,14 +120,16 @@ type Cache struct {
 // since the cache holds data in memory.
 //
 // If maxBytes is less than 32MB, then the minimum cache capacity is 32MB.
+// 如果 maxBytes 小于 32MB，则最小缓存容量为 32MB
 func New(maxBytes int) *Cache {
 	if maxBytes <= 0 {
 		panic(fmt.Errorf("maxBytes must be greater than 0; got %d", maxBytes))
 	}
 	var c Cache
+	// maxBytes先按照512字节向上对齐
 	maxBucketBytes := uint64((maxBytes + bucketsCount - 1) / bucketsCount)
 	for i := range c.buckets[:] {
-		c.buckets[i].Init(maxBucketBytes)
+		c.buckets[i].Init(maxBucketBytes) // 初始化每个桶
 	}
 	return &c
 }
@@ -141,13 +143,15 @@ func New(maxBytes int) *Cache {
 // Pass higher maxBytes value to New if the added items disappear
 // frequently.
 //
+// 由于缓存溢出或不太可能的哈希冲突，存储的条目可能随时被驱逐。如果添加的项目经常消失，则将更高的 maxBytes 值传递给 New。
+//
 // (k, v) entries with summary size exceeding 64KB aren't stored in the cache.
 // SetBig can be used for storing entries exceeding 64KB.
 //
 // k and v contents may be modified after returning from Set.
 func (c *Cache) Set(k, v []byte) {
 	h := xxhash.Sum64(k)
-	idx := h % bucketsCount
+	idx := h % bucketsCount // 计算桶位置
 	c.buckets[idx].Set(k, v, h)
 }
 
@@ -168,6 +172,7 @@ func (c *Cache) Get(dst, k []byte) []byte {
 // HasGet works identically to Get, but also returns whether the given key
 // exists in the cache. This method makes it possible to differentiate between a
 // stored nil/empty value versus and non-existing value.
+// 与 Get 相同，但也返回给定键是否存在于缓存中。这种方法可以区分存储的空值与不存在的值。
 func (c *Cache) HasGet(dst, k []byte) ([]byte, bool) {
 	h := xxhash.Sum64(k)
 	idx := h % bucketsCount
@@ -222,13 +227,13 @@ type bucket struct {
 	chunks [][]byte
 
 	// m maps hash(k) to idx of (k, v) pair in chunks.
-	m map[uint64]uint64
+	m map[uint64]uint64 // 这里存储每个hashcode对应的chunk中的偏移量。
 
 	// idx points to chunks for writing the next (k, v) pair.
-	idx uint64
+	idx uint64 // idx 指向用于写入下一个 (k, v) 对的块
 
 	// gen is the generation of chunks.
-	gen uint64
+	gen uint64 // 当所有的chunks都写满以后，gen的值加1，从第0块开始淘汰旧数据。
 
 	getCalls    uint64
 	setCalls    uint64
@@ -307,52 +312,65 @@ func (b *bucket) Set(k, v []byte, h uint64) {
 		// with 2 bytes (see below). Skip the entry.
 		return
 	}
+	// 每条数据头
 	var kvLenBuf [4]byte
-	kvLenBuf[0] = byte(uint16(len(k)) >> 8)
+	kvLenBuf[0] = byte(uint16(len(k)) >> 8) // TODO ？
 	kvLenBuf[1] = byte(len(k))
-	kvLenBuf[2] = byte(uint16(len(v)) >> 8)
+	kvLenBuf[2] = byte(uint16(len(v)) >> 8) // TODO ？
 	kvLenBuf[3] = byte(len(v))
 	kvLen := uint64(len(kvLenBuf) + len(k) + len(v))
-	if kvLen >= chunkSize {
+	if kvLen >= chunkSize { // 不要存储太大的键和值，因为它们不适合一个块
 		// Do not store too big keys and values, since they do not
 		// fit a chunk.
 		return
 	}
 
 	chunks := b.chunks
-	needClean := false
+	needClean := false // 清理标记状态
 	b.mu.Lock()
-	idx := b.idx
-	idxNew := idx + kvLen
+	idx := b.idx          // 当前存储数据索引位置
+	idxNew := idx + kvLen // 存放完数据后索引的位置
 	chunkIdx := idx / chunkSize
 	chunkIdxNew := idxNew / chunkSize
+	// 新的索引是否超过当前索引
+	// 因为还有chunkIdx等于chunkIdxNew情况，所以需要先判断一下
 	if chunkIdxNew > chunkIdx {
+		// 校验是否新索引已到chunks数组的边界
+		// 已到边界，那么循环链表从头开始
 		if chunkIdxNew >= uint64(len(chunks)) {
 			idx = 0
 			idxNew = kvLen
 			chunkIdx = 0
 			b.gen++
+			// 当 gen 等于 1<<genSizeBits时，才会等于0
+			// 也就是用来限定 gen 的边界为1<<genSizeBits
 			if b.gen&((1<<genSizeBits)-1) == 0 {
 				b.gen++
 			}
 			needClean = true
 		} else {
+			// 未到 chunks数组的边界,从下一个chunk开始
 			idx = chunkIdxNew * chunkSize
 			idxNew = idx + kvLen
 			chunkIdx = chunkIdxNew
 		}
+		// 当需要清楚时，按块清除。块内数据全部删除。
 		chunks[chunkIdx] = chunks[chunkIdx][:0]
 	}
 	chunk := chunks[chunkIdx]
-	if chunk == nil {
+	if chunk == nil { // 初始化当前块
 		chunk = getChunk()
 		chunk = chunk[:0]
 	}
+	// 写入lenBuf+K+V数据
 	chunk = append(chunk, kvLenBuf[:]...)
 	chunk = append(chunk, k...)
 	chunk = append(chunk, v...)
 	chunks[chunkIdx] = chunk
-	b.m[h] = idx | (b.gen << bucketSizeBits)
+	// 因为 idx 不能超过bucketSizeBits，所以用一个 uint64 同时表示gen和idx
+	// 所以高于bucketSizeBits位置表示gen
+	// 低于bucketSizeBits位置表示idx
+	b.m[h] = idx | (b.gen << bucketSizeBits) // 存储了层数和索引位置
 	b.idx = idxNew
 	if needClean {
 		b.cleanLocked()
@@ -370,7 +388,12 @@ func (b *bucket) Get(dst, k []byte, h uint64, returnDst bool) ([]byte, bool) {
 	if v > 0 {
 		gen := v >> bucketSizeBits
 		idx := v & ((1 << bucketSizeBits) - 1)
-		if gen == bGen && idx < b.idx || gen+1 == bGen && idx >= b.idx || gen == maxGen && bGen == 1 && idx >= b.idx {
+		// 这里说明chunks还没被写满
+		if gen == bGen && idx < b.idx ||
+			// 这里说明chunks已被写满，并且当前数据没有被覆盖
+			gen+1 == bGen && idx >= b.idx ||
+			// 这里是边界条件gen已是最大，并且chunks已被写满bGen从1开始，，并且当前数据没有被覆盖
+			gen == maxGen && bGen == 1 && idx >= b.idx {
 			chunkIdx := idx / chunkSize
 			if chunkIdx >= uint64(len(chunks)) {
 				// Corrupted data during the load from file. Just skip it.
