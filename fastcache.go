@@ -334,10 +334,10 @@ func (b *bucket) Set(k, v []byte, h uint64) {
 	chunkIdxNew := idxNew / chunkSize
 	// 新的索引是否超过当前索引
 	// 因为还有chunkIdx等于chunkIdxNew情况，所以需要先判断一下
-	if chunkIdxNew > chunkIdx {
+	if chunkIdxNew > chunkIdx { // 使用下一个块，当前块可能会产生内存碎片
 		// 校验是否新索引已到chunks数组的边界
 		// 已到边界，那么循环链表从头开始
-		if chunkIdxNew >= uint64(len(chunks)) {
+		if chunkIdxNew >= uint64(len(chunks)) { // 整个桶的chunks已经写满，准备循环写入，覆盖旧数据。
 			idx = 0
 			idxNew = kvLen
 			chunkIdx = 0
@@ -370,6 +370,11 @@ func (b *bucket) Set(k, v []byte, h uint64) {
 	// 因为 idx 不能超过bucketSizeBits，所以用一个 uint64 同时表示gen和idx
 	// 所以高于bucketSizeBits位置表示gen
 	// 低于bucketSizeBits位置表示idx
+
+	// 0000-0000000000-0000000001|0000000000-0000000000-0000000000-0000000000  b.gen << bucketSizeBits
+	// 0000-0000000000-0000000000|0000000000-0000000000-0000000100-0010100000  idx
+	//               gen         |              idx
+	// 0000-0000000000-0000000001|0000000000-0000000000-0000000100-0010100000
 	b.m[h] = idx | (b.gen << bucketSizeBits) // 存储了层数和索引位置
 	b.idx = idxNew
 	if needClean {
@@ -384,9 +389,17 @@ func (b *bucket) Get(dst, k []byte, h uint64, returnDst bool) ([]byte, bool) {
 	chunks := b.chunks
 	b.mu.RLock()
 	v := b.m[h]
+	// 0000-0000000000-0000000000|1111111111-1111111111-1111111111-1111111111  (1 << genSizeBits) - 1
+	// 0000-0000000000-0000000000|0000000000-0000000000-0000000000-0000000001  b.gen
+	// 0000-0000000000-0000000000|0000000000-0000000000-0000000000-0000000001
 	bGen := b.gen & ((1 << genSizeBits) - 1)
 	if v > 0 {
+		// 0000-0000000000-0000000001|0000000000-0000000000-0000000100-0010100000  v
+		// 0000-0000000000-0000000000|0000000000-0000000000-0000000000-0000000001  v >> bucketSizeBits
 		gen := v >> bucketSizeBits
+		// 0000-0000000000-0000000001|0000000000-0000000000-0000000100-0010100000  v
+		// 0000-0000000000-0000000000|1111111111-1111111111-1111111111-1111111111  (1 << genSizeBits) - 1
+		// 0000-0000000000-0000000000|0000000000-0000000000-0000000100-0010100000  idx
 		idx := v & ((1 << bucketSizeBits) - 1)
 		// 这里说明chunks还没被写满
 		if gen == bGen && idx < b.idx ||
@@ -394,6 +407,7 @@ func (b *bucket) Get(dst, k []byte, h uint64, returnDst bool) ([]byte, bool) {
 			gen+1 == bGen && idx >= b.idx ||
 			// 这里是边界条件gen已是最大，并且chunks已被写满bGen从1开始，，并且当前数据没有被覆盖
 			gen == maxGen && bGen == 1 && idx >= b.idx {
+
 			chunkIdx := idx / chunkSize
 			if chunkIdx >= uint64(len(chunks)) {
 				// Corrupted data during the load from file. Just skip it.
